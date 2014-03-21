@@ -1,0 +1,142 @@
+#include "msp430.h"
+#include "msp430f5528.h"
+//#include "msp430_uart.h"
+#include <stdio.h>
+
+#define IRDATA BIT2
+#define DEBUG_PIN BIT5
+#define IRVALID BIT3
+#define FRAMELEN 4
+
+
+/*
+ * main.c
+ */
+static int count = 0;			// stop after all the bits have been read in
+char startcheck = 0;
+char endcheck = 0;
+char roomid=0;
+unsigned battAD=0;
+int lcv = 0;
+unsigned int temp = 0;
+float onecount = 0;
+unsigned long data = 0;
+char frame[4]={0x00,0x00,0x00,0x00};
+int packet =0;
+
+void Sensor_LDO_Enable(char state)
+{
+	//Use this function to enable the LDO that powers the sensor: TP2
+	P4SEL &= 0xEF; //Set P4.4 to GPIO
+	P4DIR |= 0x10; //Set P4.4 to output
+	if (state)
+		P4OUT |= 0x10; //Set P4.4 to 1
+	else
+		P4OUT &= 0xEF; //Set P4.4 to 0
+
+}
+
+#pragma vector = PORT1_VECTOR
+__interrupt void Port_1()
+{
+	P1IE &= ~IRDATA;				// Turn off P1 interrupts while we work
+	P1IFG &= ~IRDATA;				// clear the P1 interrupt flag for IRDATA
+
+	frame[packet] = 1;  						// first start bit, inverted from receiver
+
+	// start timer
+	TA0CCTL0 |= CCIE;				// enable timer interrupts
+	TA0CTL = TASSEL_2;   			// TimerA0 clock selection - SMCLK
+	TA0CCR0 &= ~CCIFG;				// clear any pending timerA interrrupt flags
+	TA0CTL |= MC_1;					// start the timer in UP mode
+}
+
+#pragma vector=TIMER0_A0_VECTOR
+__interrupt void Timer_A0()
+{
+	/*
+	 * Need to track the state of a few things... the last toggle bit, the last command issued,
+	 * the count of how many bits we have parsed.
+	 */
+
+
+	TA0CCTL0 &= ~CCIE;				// clear the interrupt flag
+
+	if (packet < 4)
+	{
+		// read IRDATA and store the value in DATA
+
+		if (frame[packet] > 0)
+			frame[packet] <<= 1;	// shift left one bit
+		P4OUT &= ~DEBUG_PIN;// uncomment this and the one a few lines down to see P1.3 toggle with each sample of IRDATA. Use a two channel oscilloscope to adjust T_INTERVAL as necessary.
+		if ((P1IN & IRDATA)!= IRDATA)//sample data right here// invert IRDATA if it is low, because the receiver is active low - append 'data' with a 1
+			frame[packet] |= 1;
+		P4OUT |= DEBUG_PIN;// as above, uncomment for timing debug use
+		count++;
+		TA0CCTL0 |= CCIE;  // turn the timer interrupts back on for the next bit
+		if (count % 8== 0)
+		{
+			packet++;
+			//count=0;
+		}
+		TA0CCR0 = 0x0575-count;
+	}
+	else
+	{
+		TA0CTL &= MC_0;				// stop the timer
+		TA0CTL |= TACLR;			// clear the timer settings to zero it out
+
+		temp = data >> 24;
+		startcheck = frame[0] & 0xF0;
+		temp = data;
+		endcheck = frame[FRAMELEN-1] & 0x0F;
+		roomid = data & 0xF0;
+		temp = data >> 8;
+		battAD = temp & 0x03FF;
+		if ((startcheck == 0xA0) && (endcheck == 0x0F))
+		{
+			//for ( lcv=0;lcv<2000;lcv++) //delay to keep LED on
+			P1OUT |= IRVALID;
+			printf("0x%02X%02X%02X%02X\n",frame[0], frame[1], frame[2], frame[3]);
+			//printf("here");
+		}
+		P1IE |= IRDATA;	// we have our IR command, reset and start listening for the next one
+		P1IFG &= ~IRDATA;
+		count = 0;
+		packet =0;
+		TA0CCR0 = 0x0575;
+
+	}
+
+	P1OUT &= ~IRVALID;
+}
+
+void main()
+{
+	WDTCTL = WDTPW | WDTHOLD;	// Stop watchdog timer
+	//UCSCTL1=0x0070; //set clock to 25MHz
+
+	//Enable LDO for Sensor
+	Sensor_LDO_Enable(0);
+	Sensor_LDO_Enable(1);
+	
+	P1DIR &= ~IRDATA;	// IRDATA is an input
+	P1DIR |= IRVALID;	//Status LED as output
+	P4DIR |= DEBUG_PIN; //Set direction  for debug pin
+	P4OUT &= ~DEBUG_PIN;
+	P1OUT &= ~IRVALID;
+
+	P2SEL = 0x04;
+	P2DIR = 0x04;
+
+	P1IFG &= ~IRDATA; //clear pending interrputs
+	P1IV = 0x0006; //enable interrupt priority
+	P1IE |= IRDATA;			// enable interrupts, watching IRDATA for a change
+	P1IES |= IRDATA;				// watch for falling edge change on IRDATA
+
+	TA0CTL = TASSEL_2 + MC_1 + ID_0; //timer source smclk in up mode divide=1
+	TA0CCR0 = 0x0575; // Adjust this value to get the proper bit interval for Timer A
+
+	__bis_SR_register(LPM1_bits + GIE);
+	// Go to sleep until Port1 interrupt happens
+}

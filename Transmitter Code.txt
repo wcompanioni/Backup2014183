@@ -1,0 +1,130 @@
+#include "msp430.h"
+#include "msp430f2132.h"
+#define T600us		23				// 600us
+#define T_one		(T600us * 2)+2	// 1200us
+#define T_zero		(T600us * 2)+2	// 1200us
+#define T1200us		(T600us * 2)
+#define T2400us		(T1200us * 2)	// 2400us
+#define T24ms		(T2400us * 10)	// 24ms
+#define BIT1_3		(BIT1 + BIT2 + BIT3) // all 3 bits, those will be used for switches
+#define FRAMELEN 4
+unsigned int counter = 0;			// main bit counter
+unsigned char startflag = 1;		// flag to indicate carrier on or off
+unsigned long tmpCommand = 0;	// copy of the current command used for shifting
+//char Command[4]={0x00,0x00,0x00,0x00};
+unsigned long Command = 0;
+unsigned long ADC_value=0;
+unsigned long tmpAD=0;
+unsigned int packet =0;
+#pragma vector=ADC10_VECTOR
+
+/*struct TxFrame
+{
+		unsigned int SoF : 4 = 0x0;
+		unsigned
+};*/
+
+__interrupt void ADC10_ISR (void)
+{
+	__bic_SR_register_on_exit(CPUOFF);        // Return to active mode }
+}
+
+// Timer A interrupt service routine
+#pragma vector=TIMER0_A0_VECTOR
+__interrupt void Timer_A0(void)
+{
+
+
+	if (startflag)
+	{						// start with start bit
+		P2SEL |= BIT1;						// carrier on
+		TACCR0 = T1200us;						// start bit is on for 1200us
+		startflag = 0;
+		//Read ADC
+		ADC10CTL0 |= ENC + ADC10SC;			// Sampling and conversion start
+		__bis_SR_register(CPUOFF + GIE);	// Low Power Mode 0 with interrupts enabled
+		ADC_value = ADC10MEM;				// Assigns the value held in ADC10MEM to the integer called ADC_value
+
+		return;
+	}
+
+	if (!startflag)						// we have 16 bits to process
+	{
+		P2SEL &= ~BIT1;
+		if (tmpCommand & 0x80000000) //send a one
+		{
+			P2SEL |= BIT1;
+			//BCSCTL2 = 0x08;//FSK -- carrier to 38kHz for a one
+			TACCR0 = T_one;
+
+		}
+		else //send a zero
+		{
+			P2SEL &= ~BIT1;
+			//BCSCTL2 = 0x00;//FSK -- carrier to ~38kHz for a zero
+			TACCR0 = T_zero;
+		}
+		tmpCommand <<= 1;
+		counter++;
+	}
+	if (counter == 33)
+	{						// we are done sending current frame
+		P2SEL &= ~BIT1;						// carrier off
+		//BCSCTL2 = 0x08;
+		counter = 0;						// reset all counters
+		startflag = 1;
+		tmpAD=ADC_value<<8;
+		tmpCommand = 0xA000000F | tmpAD | P3IN; //combine new command with start nibble, A/D status, Room ID, end nibble
+		//tmpCommand = 0xAAAAAAAA;
+		TA0CTL = TASSEL_2 + MC_1 + ID_0;
+		TACCR0 = 0xFFFF;						// set timer time for next frame
+		__bis_SR_register_on_exit(LPM1_bits+GIE);
+		// wait for another interrupt
+
+	}
+}
+
+
+void main(void)
+{
+	WDTCTL = WDTPW + WDTHOLD;		// stop WDT
+
+	//Set up clocks
+	/*DCOCTL = 0x80;	// DCO = ~300kHz
+	 BCSCTL1 = 0x01;		// as above
+	 BCSCTL2 = 0x04;		// divide SMCLK by 8 which will give us ~38kHz*/
+
+	BCSCTL2 = 0x08; //Enable SMCLK to come from LFXTL1
+	BCSCTL3 = 0x0C;
+
+	//Set up ports
+	P2DIR |= BIT1;// port 2.1 is configured as SMCLK out and connected to IR emitter, this will be our carrier frequency, 38kHz
+	P2OUT &= ~BIT1;		// turn carrier off
+	P3DIR = 0x00;
+	P3REN = 0xFF;
+	P3OUT = 0x00;
+
+	//Set up ADC10
+	ADC10CTL1 = INCH_0 + ADC10DIV_1 ;         // Channel 0, ADC10CLK
+	ADC10CTL0 = SREF_0 + ADC10SHT_3 + ADC10ON + ADC10IE;  // Vcc & Vss as reference, Sample and hold for 4 Clock cycles, ADC on, ADC interrupt enable
+	ADC10AE0 |= BIT0; // ADC input enable P2.0
+
+	//Get first ADC Sample
+	ADC10CTL0 |= ENC + ADC10SC;			// Sampling and conversion start
+	__bis_SR_register(CPUOFF + GIE);	// Low Power Mode 0 with interrupts enabled
+	ADC_value = ADC10MEM;				// Assigns the value held in ADC10MEM to the integer called ADC_value
+
+	//Set up frame with encoder input
+	tmpAD=ADC_value<<8;
+	Command = 0xA000000F | P3IN | tmpAD;
+	tmpCommand = Command;
+
+	//Set up timer
+	TA0CCTL0 = CCIE; //Enable Timer A interrupt
+	TA0CCR0 = T600us; // interrupt every 600us for starters
+	TA0CTL = TASSEL_2 + MC_1 + ID_0; // clock source is SMCLK, upmode
+
+	__bis_SR_register(LPM1_bits + GIE); // switch to LPM1 with interrupts
+
+}
+
